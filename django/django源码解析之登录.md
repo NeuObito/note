@@ -95,3 +95,65 @@ def rotate_token(request):
     request.csrf_cookie_needs_reset = True
 ```
 最后是信号的传递，这个会专门做一节。
+回过头来，我们看到request会有一个session项，这个是哪里来的呢？
+这就是django的中间件技术，Django的中间件框架，是django处理请求和响应的一套钩子函数的集合。传统的django视图模式一般是这样的：http请求->view->http响应，而加入中间件框架后，则变为：http请求->中间件处理->app->中间件处理->http响应。而在django中这两个处理分别对应process_request和process_response函数，这两个钩子函数将会在特定的时候被触发。
+那么session的中间件是什么呢？
+我们创建django项目时，settings.py中会有默认的session中间件，SessionMiddleware：
+```python
+class SessionMiddleware(object):
+    def __init__(self):
+        engine = import_module(settings.SESSION_ENGINE)
+        self.SessionStore = engine.SessionStore
+
+    def process_request(self, request):
+        session_key = request.COOKIES.get(settings.SESSION_COOKIE_NAME)
+        request.session = self.SessionStore(session_key)
+
+    def process_response(self, request, response):
+        """
+        If request.session was modified, or if the configuration is to save the
+        session every time, save the changes and set a session cookie or delete
+        the session cookie if the session has been emptied.
+        """
+        try:
+            accessed = request.session.accessed
+            modified = request.session.modified
+            empty = request.session.is_empty()
+        except AttributeError:
+            pass
+        else:
+            # First check if we need to delete this cookie.
+            # The session should be deleted only if the session is entirely empty
+            if settings.SESSION_COOKIE_NAME in request.COOKIES and empty:
+                response.delete_cookie(settings.SESSION_COOKIE_NAME,
+                    domain=settings.SESSION_COOKIE_DOMAIN)
+            else:
+                if accessed:
+                    patch_vary_headers(response, ('Cookie',))
+                if (modified or settings.SESSION_SAVE_EVERY_REQUEST) and not empty:
+                    if request.session.get_expire_at_browser_close():
+                        max_age = None
+                        expires = None
+                    else:
+                        max_age = request.session.get_expiry_age()
+                        expires_time = time.time() + max_age
+                        expires = cookie_date(expires_time)
+                    # Save the session data and refresh the client cookie.
+                    # Skip session save for 500 responses, refs #3881.
+                    if response.status_code != 500:
+                        try:
+                            request.session.save()
+                        except UpdateError:
+                            # The user is now logged out; redirecting to same
+                            # page will result in a redirect to the login page
+                            # if required.
+                            return redirect(request.path)
+                        response.set_cookie(settings.SESSION_COOKIE_NAME,
+                                request.session.session_key, max_age=max_age,
+                                expires=expires, domain=settings.SESSION_COOKIE_DOMAIN,
+                                path=settings.SESSION_COOKIE_PATH,
+                                secure=settings.SESSION_COOKIE_SECURE or None,
+                                httponly=settings.SESSION_COOKIE_HTTPONLY or None)
+        return response
+```
+在请求过来之后，django中间件会发挥作用，process_request会在请求的Cookie中取出session_key，并把一个新的session对象赋给request.session，而在返回响应时，process_response则判断session是否被修改或者是否过期，来更新session信息。

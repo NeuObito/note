@@ -127,3 +127,37 @@ class ModelBackend(object):
 USERNAME_FIELD = 'username'
 ```
 获取到用户名之后，django会去数据库中拿到user，之后再验证密码是否正确，如果密码正确并且user.is_active是True，则返回user(自定义用户结构可以没有is_active属性)。如果不能通过用户名获取到用户，django会运行一次密码哈希函数，来减少存在用户和不存在用户之间的差异。
+在认证的时候，会通过一个中间件AuthenticationMiddleware，这个是创建项目的时候自带的。
+```python
+class AuthenticationMiddleware(MiddlewareMixin):
+    def process_request(self, request):
+        assert hasattr(request, 'session'), (
+            "The Django authentication middleware requires session middleware "
+            "to be installed. Edit your MIDDLEWARE%s setting to insert "
+            "'django.contrib.sessions.middleware.SessionMiddleware' before "
+            "'django.contrib.auth.middleware.AuthenticationMiddleware'."
+        ) % ("_CLASSES" if settings.MIDDLEWARE is None else "")
+        request.user = SimpleLazyObject(lambda: get_user(request))
+```
+在process_request中，通过request.class.user = LazyUser()在request设置了一个全局的可缓存的用户对象。
+```python
+class LazyUser(object):
+    def __get__(self, request, obj_type=None):
+        if not hasattr(request, '_cached_user'):
+            from django.contrib.auth import get_user
+            request._cached_user = get_user(request)
+        return request._cached_user
+```
+在get_user里，会在检查session中是否存放了当前用户对应的user_id，如果有，则通过id在model查找相应的用户返回，否则返回一个匿名的用户对象(AnonymousUser)。
+```python
+def get_user(request):
+    from django.contrib.auth.models import AnonymousUser
+    try:
+        user_id = request.session[SESSION_KEY]
+        backend_path = request.session[BACKEND_SESSION_KEY]
+        backend = load_backend(backend_path)
+        user = backend.get_user(user_id) or AnonymousUser()
+    except KeyError:
+        user = AnonymousUser()
+    return user
+```

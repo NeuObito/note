@@ -157,3 +157,19 @@ class SessionMiddleware(object):
         return response
 ```
 在请求过来之后，django中间件会发挥作用，process_request会在请求的Cookie中取出session_key，并把一个新的session对象赋给request.session，而在返回响应时，process_response则判断session是否被修改或者是否过期，来更新session信息。
+Django使用的session默认都继承于SessionBase类里，这个类实现了一些session操作方法，以及hash,decode，encode等方法。
+```python
+class SessionBase(object):
+    """
+    Base class for all Session classes.
+    """
+    TEST_COOKIE_NAME = 'testcookie'
+    TEST_COOKIE_VALUE = 'worked'
+
+    def __init__(self, session_key=None):
+        self._session_key = session_key
+        self.accessed = False
+        self.modified = False
+        self.serializer = import_string(settings.SESSION_SERIALIZER)
+```
+说的更直白一些，其实django中的session就是一个模拟dict的对象，并实现了一系列的hash和序列化方法，默认持久化在数据库中（有时候也可能由于为了提高性能，用redis之类的内存数据库来缓存session）。

@@ -1,5 +1,5 @@
 ### Signal(django.dispatch)
-Django提供一个信号分发器，允许解耦的应用在框架的其它地方发生操作时会被通知到。简单来说，信号允许特定的sender通知一组receiver某些操作已经发生。这在多处代码和同一事件有关联的情况下很有用。
+Django提供一个信号分发器，允许解耦的应用在框架的其它地方发生操作时会被通知到。简单来说，信号允许特定的sender通知一组receiver某些操作已经发生。这在多处代码和同一事件有关联的情况下很有用。熟悉的开发者可以把Django提供的Signals机制看做为一种发布/订阅者模式，一个Siganl可以有多个订阅者，当一个Signal发出的时候，所有订阅了该信号的阅读者都会收到该信号并运行。Signal不是异步模式，而是同步模式，但是线程安全。
 
 #### 监听信号
 你需要注册一个receiver函数来接受信号，它在信号通过使用Signal.connect()方式发送时被调用。
@@ -116,4 +116,102 @@ receiver 参数表示要断开的已注册receiver。如果使用dispatch_uid标
 #### Test signals
 - template_rendered
 
+### Signal源码
+#### Python中的弱引用
+在Signals中，使用了弱引用weakref作为缓存的使用，以及在为信号加入订阅者的时候是通过弱引用来实现的，这样就保证了已经被回收的订阅者不再接收到信号的发出。
+```python
+    def __init__(self, providing_args=None, use_caching=False):
+        """
+        Create a new signal.
 
+        providing_args
+            A list of the arguments this signal can pass along in a send() call.
+        """
+        self.receivers = []
+        if providing_args is None:
+            providing_args = []
+        self.providing_args = set(providing_args)
+        self.lock = threading.Lock()
+        self.use_caching = use_caching
+        # For convenience we create empty caches even if they are not used.
+        # A note about caching: if use_caching is defined, then for each
+        # distinct sender we cache the receivers that sender has in
+        # 'sender_receivers_cache'. The cache is cleaned when .connect() or
+        # .disconnect() is called and populated on send().
+        self.sender_receivers_cache = weakref.WeakKeyDictionary() if use_caching else {}
+        self._dead_receivers = False
+
+```
+在Signals的connect方法中，也是将订阅信号的函数或者实例方法设置为弱引用：
+```python
+# Signals.connect()
+        if weak:
+            ref = weakref.ref
+            receiver_object = receiver
+            # Check for bound methods
+            if hasattr(receiver, '__self__') and hasattr(receiver, '__func__'):
+                ref = WeakMethod
+                receiver_object = receiver.__self__
+            if six.PY3:
+                receiver = ref(receiver)
+                weakref.finalize(receiver_object, self._remove_receiver)
+            else:
+                receiver = ref(receiver, self._remove_receiver)
+```
+当函数或者实例方法被回收的时候，就会触发self._remove_receiver方法，该方法会设置self._dead_receivers = True，而Signals在connect，disconnect，send等实例方法调用之前都会检查该标志，如果为真则清除已经失效的弱引用。
+注意，__self__和__func__是为了区分函数和实例方法的。
+
+#### 线程锁
+在Signals中的__init__.py中可以看到订阅者都被存储在self.receivers这个列表中，因此这个列表需要保证是线程安全的，需要加上线程锁来保证在信号通知订阅者的中途不会发生订阅者突然被删除的情况。
+```python
+# Signals.connect()
+        with self.lock:
+            self._clear_dead_receivers()
+            for r_key, _ in self.receivers:
+                if r_key == lookup_key:
+                    break
+            else:
+                self.receivers.append((lookup_key, receiver))
+            self.sender_receivers_cache.clear()
+```
+Django Signals在使用send方法的时候，获取当前receivers的时候调用了self._live_receivers，所以这个方法也需要是线程安全的：
+```python
+ def _live_receivers(self, sender):
+        """
+        Filter sequence of receivers to get resolved, live receivers.
+
+        This checks for weak references and resolves them, then returning only
+        live receivers.
+        """
+        receivers = None
+        if self.use_caching and not self._dead_receivers:
+            receivers = self.sender_receivers_cache.get(sender)
+            # We could end up here with NO_RECEIVERS even if we do check this case in
+            # .send() prior to calling _live_receivers() due to concurrent .send() call.
+            if receivers is NO_RECEIVERS:
+                return []
+        if receivers is None:
+            with self.lock:
+                self._clear_dead_receivers()
+                senderkey = _make_id(sender)
+                receivers = []
+                for (receiverkey, r_senderkey), receiver in self.receivers:
+                    if r_senderkey == NONE_ID or r_senderkey == senderkey:
+                        receivers.append(receiver)
+                if self.use_caching:
+                    if not receivers:
+                        self.sender_receivers_cache[sender] = NO_RECEIVERS
+                    else:
+                        # Note, we must cache the weakref versions.
+                        self.sender_receivers_cache[sender] = receivers
+        non_weak_receivers = []
+        for receiver in receivers:
+            if isinstance(receiver, weakref.ReferenceType):
+                # Dereference the weak reference.
+                receiver = receiver()
+                if receiver is not None:
+                    non_weak_receivers.append(receiver)
+            else:
+                non_weak_receivers.append(receiver)
+        return non_weak_receivers
+```
